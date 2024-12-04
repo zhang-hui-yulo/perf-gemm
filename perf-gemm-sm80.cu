@@ -406,6 +406,8 @@ int main() {
         }
     }
 
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     gpu_compare(d_c1.data().get(), d_c2.data().get(), m * n);
 
