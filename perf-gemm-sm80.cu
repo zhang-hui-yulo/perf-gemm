@@ -11,41 +11,6 @@
 #include "neo/tensor.hpp"
 #include "neo/numeric/integral_constant.hpp"
 
-struct NeoConfig {
-    using T = half;
-
-    static constexpr int TILE_M = 128, TILE_N = 128, TILE_K = 32;
-    static constexpr int MMA_M = 16, MMA_N = 16, MMA_K = 16;
-    static constexpr int CopyUnitSize = 16;
-    static constexpr int Threads = 128;
-    static constexpr int WrapSize = 32;
-    static constexpr int WrapCount = Threads / WrapSize;
-    static constexpr int CopyCount = CopyUnitSize / sizeof(T);
-    static constexpr int CopyColAB = TILE_K / CopyCount;
-    static constexpr int CopyRowAB = Threads / CopyColAB;
-    static constexpr int CopyColC = TILE_N / CopyCount;
-    static constexpr int CopyRowC = Threads / CopyColC;
-    static constexpr int Stage = 3;
-
-    using CopyTiledShapeA = decltype(neo::make_shape(neo::Int<CopyRowAB>{}, neo::Int<CopyColAB * CopyCount>{}));
-    using CopyThrdShapeA = decltype(neo::make_shape(neo::Int<CopyRowAB>{}, neo::Int<CopyColAB>{}));
-    using CopyTiledShapeB = CopyTiledShapeA;
-    using CopyThrdShapeB = CopyThrdShapeA;
-    using CopyTiledShapeC = decltype(neo::make_shape(neo::Int<CopyRowC>{}, neo::Int<CopyColC * CopyCount>{}));
-    using CopyThrdShapeC = decltype(neo::make_shape(neo::Int<CopyRowC>{}, neo::Int<CopyColC>{}));
-
-    static constexpr int PartitionA = 2;
-    static constexpr int PartitionB = WrapCount / PartitionA;
-    static constexpr int PartitionM = TILE_M / WrapCount * PartitionA;
-    static constexpr int PartitionN = TILE_N / WrapCount * PartitionB;
-    using TiledMmaShapeA = decltype(neo::make_shape(neo::Int<PartitionM>{}, neo::Int<MMA_K>{}));
-    using TiledMmaShapeB = decltype(neo::make_shape(neo::Int<PartitionN>{}, neo::Int<MMA_K>{}));
-    using TiledMmaShapeC = decltype(neo::make_shape(neo::Int<PartitionM>{}, neo::Int<PartitionN>{}));
-
-    using MmaShapeA = decltype(neo::make_shape(neo::Int<MMA_M>{}, neo::Int<MMA_K>{}));
-    using MmaShapeB = decltype(neo::make_shape(neo::Int<MMA_N>{}, neo::Int<MMA_K>{}));
-    using MmaShapeC = decltype(neo::make_shape(neo::Int<MMA_N>{}, neo::Int<MMA_N>{}));
-};
 
 template <typename T>
 __global__ void gpu_compare_kernel(const T* x, const T* y, int n,
@@ -72,34 +37,80 @@ __global__ void gpu_compare_kernel(const T* x, const T* y, int n,
 }
 
 template <typename T>
-void gpu_compare(const T *x, const T *y, int n, float threshold = 1.E-1) {
-  int *num_count;
-  float *max_error;
-  cudaMalloc(&num_count, sizeof(int));
-  cudaMalloc(&max_error, sizeof(float));
-  cudaMemset(num_count, 0, sizeof(int));
-  cudaMemset(max_error, 0, sizeof(float));
+void gpu_compare(const T* x, const T* y, int n, float threshold = 1.E-1) {
+    int* num_count;
+    float* max_error;
+    cudaMalloc(&num_count, sizeof(int));
+    cudaMalloc(&max_error, sizeof(float));
+    cudaMemset(num_count, 0, sizeof(int));
+    cudaMemset(max_error, 0, sizeof(float));
 
-  dim3 block(256);
-  dim3 grid((n + block.x - 1) / block.x);
-  gpu_compare_kernel<<<grid, block>>>(x, y, n, threshold, num_count, max_error);
-  int num = 0;
-  float error = 0;
-  cudaMemcpy(&num, num_count, sizeof(int), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&error, max_error, sizeof(int), cudaMemcpyDeviceToHost);
-  cudaDeviceSynchronize();
+    dim3 block(256);
+    dim3 grid((n + block.x - 1) / block.x);
+    gpu_compare_kernel << <grid, block >> > (x, y, n, threshold, num_count, max_error);
+    int num = 0;
+    float error = 0;
+    cudaMemcpy(&num, num_count, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&error, max_error, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
 
-  if (num == 0) {
-    std::cout << "check ok, max_error = " << error << std::endl;
-  } else {
-    std::cout << "===============================" << std::endl <<
-    "check fail: diff " << num << " max_error = " << error << std::endl <<
-    "===============================" << std::endl;
-  }
+    if (num == 0) {
+        std::cout << "check ok, max_error = " << error << std::endl;
+    }
+    else {
+        std::cout << "===============================" << std::endl <<
+            "check fail: diff " << num << " max_error = " << error << std::endl <<
+            "===============================" << std::endl;
+    }
 }
 
+struct NeoConfig {
+    using T = half;
+
+    static constexpr int TILE_M = 128, TILE_N = 128, TILE_K = 32;
+    static constexpr int MMA_M = 16, MMA_N = 16, MMA_K = 16;
+    static constexpr int CopyUnitSize = 16;
+    static constexpr int Threads = 128;
+    static constexpr int WrapSize = 32;
+    static constexpr int WrapCount = Threads / WrapSize;
+    static constexpr int CopyCount = CopyUnitSize / sizeof(T);
+    static constexpr int CopyColAB = TILE_K / CopyCount;
+    static constexpr int CopyRowAB = Threads / CopyColAB;
+    static constexpr int CopyColC = TILE_N / CopyCount;
+    static constexpr int CopyRowC = Threads / CopyColC;
+    static constexpr int Stage = 2;
+    static constexpr int PADDING_A = 8;
+    static constexpr int PADDING_B = 8;
+    static constexpr int PADDING_C = 0;
+    static constexpr int ShmAsizeBase = TILE_M * (TILE_K + PADDING_A);
+    static constexpr int ShmBsizeBase = TILE_N * (TILE_K + PADDING_B);
+    static constexpr int ShmAsize = ShmAsizeBase * Stage;
+    static constexpr int ShmBsize = ShmBsizeBase * Stage;
+    static constexpr int ShmCsize = TILE_M * (TILE_N + PADDING_C);
+    static constexpr int ShmSize = std::max(ShmAsize + ShmBsize, ShmCsize) * sizeof(T);
+
+    using CopyTiledShapeA = decltype(neo::make_shape(neo::Int<CopyRowAB>{}, neo::Int<CopyColAB* CopyCount>{}));
+    using CopyThrdShapeA = decltype(neo::make_shape(neo::Int<CopyRowAB>{}, neo::Int<CopyColAB>{}));
+    using CopyTiledShapeB = CopyTiledShapeA;
+    using CopyThrdShapeB = CopyThrdShapeA;
+    using CopyTiledShapeC = decltype(neo::make_shape(neo::Int<CopyRowC>{}, neo::Int<CopyColC* CopyCount>{}));
+    using CopyThrdShapeC = decltype(neo::make_shape(neo::Int<CopyRowC>{}, neo::Int<CopyColC>{}));
+
+    static constexpr int PartitionA = 2;
+    static constexpr int PartitionB = WrapCount / PartitionA;
+    static constexpr int PartitionM = TILE_M / WrapCount * PartitionA;
+    static constexpr int PartitionN = TILE_N / WrapCount * PartitionB;
+    using TiledMmaShapeA = decltype(neo::make_shape(neo::Int<PartitionM>{}, neo::Int<MMA_K>{}));
+    using TiledMmaShapeB = decltype(neo::make_shape(neo::Int<PartitionN>{}, neo::Int<MMA_K>{}));
+    using TiledMmaShapeC = decltype(neo::make_shape(neo::Int<PartitionM>{}, neo::Int<PartitionN>{}));
+
+    using MmaShapeA = decltype(neo::make_shape(neo::Int<MMA_M>{}, neo::Int<MMA_K>{}));
+    using MmaShapeB = decltype(neo::make_shape(neo::Int<MMA_N>{}, neo::Int<MMA_K>{}));
+    using MmaShapeC = decltype(neo::make_shape(neo::Int<MMA_N>{}, neo::Int<MMA_N>{}));
+};
+
 template <typename Config>
-__global__ /*__launch_bounds__(128, 1)*/
+__global__ /*__launch_bounds__(128, 1) */
 void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a, const Config::T* __restrict__ b, const int m, const int n, const int k) {
     int idx = threadIdx.x;
     int ix = blockIdx.x;
@@ -107,19 +118,11 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
     int wrapid = idx / Config::WrapSize;
     int tiledM = wrapid / Config::PartitionA;
     int tiledN = wrapid % Config::PartitionB;
-    
-    constexpr int PADDING_A = 8;
-    constexpr int PADDING_B = 8;
-    constexpr int PADDING_C = 0;
 
     using T = typename Config::T;
-    constexpr int shm_a_size = Config::TILE_M * (Config::TILE_K + PADDING_A);
-    constexpr int shm_b_size = Config::TILE_N * (Config::TILE_K + PADDING_B);
-    constexpr int shm_c_size = Config::TILE_M * (Config::TILE_N + PADDING_C);
-    constexpr int shm_size = shm_a_size + shm_b_size > shm_c_size ? shm_a_size + shm_b_size : shm_c_size;
-    __shared__ T shmem[shm_size];
+    extern __shared__ T shmem[];
     auto shm_a = shmem;
-    auto shm_b = shmem + shm_a_size;
+    auto shm_b = shmem + Config::ShmAsize;
     auto shm_c = shmem;
 
     using CopyTiledShapeA = typename Config::CopyTiledShapeA;
@@ -129,7 +132,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
 
     auto A = neo::make_tensor(a, neo::make_shape(m, k), neo::make_stride(k, neo::Int<1>{}));
     auto gA = neo::local_tile(A, neo::make_shape(neo::Int<Config::TILE_M>{}, neo::Int<Config::TILE_K>{}), neo::make_coord(iy, neo::Int<0>{}));
-    auto sA = neo::make_tensor(shm_a, neo::make_shape(neo::Int<Config::TILE_M>{}, neo::Int<Config::TILE_K>{}), neo::make_stride(neo::Int<Config::TILE_K + PADDING_A>{}, neo::Int<1>{}));
+    auto sA = neo::make_tensor(shm_a, neo::make_shape(neo::Int<Config::TILE_M>{}, neo::Int<Config::TILE_K>{}), neo::make_stride(neo::Int<Config::TILE_K + Config::PADDING_A>{}, neo::Int<1>{}));
     auto gOuterShapeA = neo::inner_div(gA.shape(), copyTiledShapeA);
     auto thrCopyCoordA = neo::copy_partition(copyThrdShapeA, idx, neo::Int<Config::CopyCount>{});
 
@@ -140,7 +143,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
 
     auto B = neo::make_tensor(b, neo::make_shape(n, k), neo::make_stride(k, neo::Int<1>{}));
     auto gB = neo::local_tile(B, neo::make_shape(neo::Int<Config::TILE_N>{}, neo::Int<Config::TILE_K>{}), neo::make_coord(ix, neo::Int<0>{}));
-    auto sB = neo::make_tensor(shm_b, neo::make_shape(neo::Int<Config::TILE_N>{}, neo::Int<Config::TILE_K>{}), neo::make_stride(neo::Int<Config::TILE_K + PADDING_B>{}, neo::Int<1>{}));
+    auto sB = neo::make_tensor(shm_b, neo::make_shape(neo::Int<Config::TILE_N>{}, neo::Int<Config::TILE_K>{}), neo::make_stride(neo::Int<Config::TILE_K + Config::PADDING_B>{}, neo::Int<1>{}));
     auto gOuterShapeB = neo::inner_div(gA.shape(), copyTiledShapeB);
     auto thrCopyCoordB = neo::copy_partition(copyThrdShapeB, idx, neo::Int<Config::CopyCount>{});
 
@@ -162,8 +165,8 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
     auto mmaShapeB = MmaShapeB{};
     auto sOuterMmaShapeB = neo::inner_div(tiledMmaB.shape(), mmaShapeB);
 
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, Config::MMA_M, Config::MMA_N, Config::MMA_K, half, nvcuda::wmma::row_major> a_frag[sOuterMmaShapeA.row_spacing][sOuterMmaShapeA.col_spacing];
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, Config::MMA_M, Config::MMA_N, Config::MMA_K, half, nvcuda::wmma::col_major> b_frag[sOuterMmaShapeB.row_spacing][sOuterMmaShapeB.col_spacing];
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, Config::MMA_M, Config::MMA_N, Config::MMA_K, half, nvcuda::wmma::row_major> a_frag[2][sOuterMmaShapeA.row_spacing][sOuterMmaShapeA.col_spacing];
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, Config::MMA_M, Config::MMA_N, Config::MMA_K, half, nvcuda::wmma::col_major> b_frag[2][sOuterMmaShapeB.row_spacing][sOuterMmaShapeB.col_spacing];
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, Config::MMA_M, Config::MMA_N, Config::MMA_K, half> c_frag[sOuterMmaShapeA.row_spacing][sOuterMmaShapeB.row_spacing];
 
 #pragma unroll
@@ -174,16 +177,22 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
         }
     }
 
+    int itile_to_read = 0;
+    int ismem_read = 0;
+    int ismem_write = 0;
+
+    // submit kStage - 1 tile
+    // gmem -> shm
 #pragma unroll
-    for (int itile = 0, ntile = k / Config::TILE_K; itile < ntile; ++itile) {
-        gA.jump(neo::make_coord(iy, itile));
+    for (int istage = 0; istage < Config::Stage - 1; ++istage) {
+        gA.jump(neo::make_coord(iy, istage));
         auto gAcopyTile = neo::local_tile(gA, copyTiledShapeA);
         auto sAcopyTile = neo::local_tile(sA, copyTiledShapeA);
 
-        gB.jump(neo::make_coord(ix, itile));
+        gB.jump(neo::make_coord(ix, istage));
         auto gBcopyTile = neo::local_tile(gB, copyTiledShapeB);
         auto sBcopyTile = neo::local_tile(sB, copyTiledShapeB);
-        
+
         // copy global A to shared A
 #pragma unroll
         for (int i = 0; i < gOuterShapeA.row_spacing; ++i) {
@@ -193,7 +202,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
                 gAcopyTile.jump(coord);
                 sAcopyTile.jump(coord);
                 auto gAptr = gAcopyTile.move_at(thrCopyCoordA);
-                auto sAptr = __cvta_generic_to_shared(sAcopyTile.move_at(thrCopyCoordA));
+                auto sAptr = __cvta_generic_to_shared(sAcopyTile.move_at(thrCopyCoordA) + istage * Config::ShmAsizeBase);
                 asm("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
                 : "l"(sAptr), "l"(gAptr), "n"(Config::CopyUnitSize));
             }
@@ -208,21 +217,63 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
                 gBcopyTile.jump(coord);
                 sBcopyTile.jump(coord);
                 auto gBptr = gBcopyTile.move_at(thrCopyCoordB);
-                auto sBptr = __cvta_generic_to_shared(sBcopyTile.move_at(thrCopyCoordB));
+                auto sBptr = __cvta_generic_to_shared(sBcopyTile.move_at(thrCopyCoordB) + istage * Config::ShmBsizeBase);
                 asm("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
                 : "l"(sBptr), "l"(gBptr), "n"(Config::CopyUnitSize));
             }
         }
 
         asm("cp.async.commit_group;\n" ::);
-        asm("cp.async.wait_group 0;\n" ::);
 
-        __syncthreads();
+        ++itile_to_read;
+        ++ismem_write;
+    }
+
+    // wait one submitted gmem->smem done
+    asm("cp.async.wait_group %0;\n" :: "n"(Config::Stage - 2));
+    __syncthreads();
+
+    // smem -> reg
+    {
+        neo::Int<0> ik{};
+        tiledMmaA.jump(neo::make_coord(tiledM, ik));
+        tiledMmaB.jump(neo::make_coord(tiledN, ik));
+        auto MmaA = neo::local_tile(tiledMmaA, mmaShapeA);
+        auto MmaB = neo::local_tile(tiledMmaB, mmaShapeB);
+#pragma unroll
+        for (int mma_m = 0; mma_m < sOuterMmaShapeA.row_spacing; ++mma_m) {
+#pragma unroll
+            for (int mma_k = 0; mma_k < sOuterMmaShapeA.col_spacing; ++mma_k) {
+                auto afragPtr = MmaA.jump_at(neo::make_coord(mma_m, mma_k)) + ismem_read * Config::ShmAsizeBase;
+                nvcuda::wmma::load_matrix_sync(a_frag[ik][mma_m][mma_k], afragPtr, MmaA.stride().row_spacing);
+            }
+        }
 
 #pragma unroll
+        for (int mma_n = 0; mma_n < sOuterMmaShapeB.row_spacing; ++mma_n) {
+#pragma unroll
+            for (int mma_k = 0; mma_k < sOuterMmaShapeB.col_spacing; ++mma_k) {
+                auto bfragPtr = MmaB.jump_at(neo::make_coord(mma_n, mma_k)) + ismem_read * Config::ShmBsizeBase;
+                nvcuda::wmma::load_matrix_sync(b_frag[ik][mma_n][mma_k], bfragPtr, MmaB.stride().row_spacing);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int itile = 0, ntile = k / Config::TILE_K; itile < ntile; ++itile) {
+#pragma unroll
         for (int ik = 0, nk = sOuterTiledMmaShapeA.col_spacing; ik < nk; ++ik) {
-            tiledMmaA.jump(neo::make_coord(tiledM, ik));
-            tiledMmaB.jump(neo::make_coord(tiledN, ik));
+            int ik_next = (ik + 1) % nk;
+
+            if (ik == nk - 1) {
+                asm("cp.async.wait_group %0;\n" :: "n"(Config::Stage - 2));
+                __syncthreads();
+
+                ismem_read = (ismem_read + 1) % Config::Stage;
+            }
+
+            tiledMmaA.jump(neo::make_coord(tiledM, ik_next));
+            tiledMmaB.jump(neo::make_coord(tiledN, ik_next));
             auto MmaA = neo::local_tile(tiledMmaA, mmaShapeA);
             auto MmaB = neo::local_tile(tiledMmaB, mmaShapeB);
 
@@ -230,8 +281,8 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
             for (int mma_m = 0; mma_m < sOuterMmaShapeA.row_spacing; ++mma_m) {
 #pragma unroll
                 for (int mma_k = 0; mma_k < sOuterMmaShapeA.col_spacing; ++mma_k) {
-                    auto afragPtr = MmaA.jump_at(neo::make_coord(mma_m, mma_k));
-                    nvcuda::wmma::load_matrix_sync(a_frag[mma_m][mma_k], afragPtr, MmaA.stride().row_spacing);
+                    auto afragPtr = MmaA.jump_at(neo::make_coord(mma_m, mma_k)) + ismem_read * Config::ShmAsizeBase;
+                    nvcuda::wmma::load_matrix_sync(a_frag[ik_next][mma_m][mma_k], afragPtr, MmaA.stride().row_spacing);
                 }
             }
 
@@ -239,9 +290,56 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
             for (int mma_n = 0; mma_n < sOuterMmaShapeB.row_spacing; ++mma_n) {
 #pragma unroll
                 for (int mma_k = 0; mma_k < sOuterMmaShapeB.col_spacing; ++mma_k) {
-                    auto bfragPtr = MmaB.jump_at(neo::make_coord(mma_n, mma_k));
-                    nvcuda::wmma::load_matrix_sync(b_frag[mma_n][mma_k], bfragPtr, MmaB.stride().row_spacing);
+                    auto bfragPtr = MmaB.jump_at(neo::make_coord(mma_n, mma_k)) + ismem_read * Config::ShmBsizeBase;
+                    nvcuda::wmma::load_matrix_sync(b_frag[ik_next][mma_n][mma_k], bfragPtr, MmaB.stride().row_spacing);
                 }
+            }
+
+            if (ik == 0) {
+                if (itile_to_read < ntile) {
+                    gA.jump(neo::make_coord(iy, itile_to_read));
+                    auto gAcopyTile = neo::local_tile(gA, copyTiledShapeA);
+                    auto sAcopyTile = neo::local_tile(sA, copyTiledShapeA);
+
+                    gB.jump(neo::make_coord(ix, itile_to_read));
+                    auto gBcopyTile = neo::local_tile(gB, copyTiledShapeB);
+                    auto sBcopyTile = neo::local_tile(sB, copyTiledShapeB);
+
+                    // copy global A to shared A
+#pragma unroll
+                    for (int i = 0; i < gOuterShapeA.row_spacing; ++i) {
+#pragma unroll
+                        for (int j = 0; j < gOuterShapeA.col_spacing; ++j) {
+                            auto coord = neo::make_coord(i, j);
+                            gAcopyTile.jump(coord);
+                            sAcopyTile.jump(coord);
+                            auto gAptr = gAcopyTile.move_at(thrCopyCoordA);
+                            auto sAptr = __cvta_generic_to_shared(sAcopyTile.move_at(thrCopyCoordA) + ismem_write * Config::ShmAsizeBase);
+                            asm("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
+                            : "l"(sAptr), "l"(gAptr), "n"(Config::CopyUnitSize));
+                        }
+                    }
+
+                    // copy global B to shared B
+#pragma unroll
+                    for (int i = 0; i < gOuterShapeB.row_spacing; ++i) {
+#pragma unroll
+                        for (int j = 0; j < gOuterShapeB.col_spacing; ++j) {
+                            auto coord = neo::make_coord(i, j);
+                            gBcopyTile.jump(coord);
+                            sBcopyTile.jump(coord);
+                            auto gBptr = gBcopyTile.move_at(thrCopyCoordB);
+                            auto sBptr = __cvta_generic_to_shared(sBcopyTile.move_at(thrCopyCoordB) + ismem_write * Config::ShmBsizeBase);
+                            asm("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
+                            : "l"(sBptr), "l"(gBptr), "n"(Config::CopyUnitSize));
+                        }
+                    }
+
+                    ++itile_to_read;
+                    ismem_write = (ismem_write + 1) % Config::Stage;
+                }
+
+                asm("cp.async.commit_group;\n" ::);
             }
 
 #pragma unroll
@@ -250,7 +348,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
                 for (int mma_n = 0; mma_n < sOuterMmaShapeB.row_spacing; ++mma_n) {
 #pragma unroll
                     for (int mma_k = 0; mma_k < sOuterMmaShapeB.col_spacing; ++mma_k) {
-                        nvcuda::wmma::mma_sync(c_frag[mma_m][mma_n], a_frag[mma_m][mma_k], b_frag[mma_n][mma_k], c_frag[mma_m][mma_n]);
+                        nvcuda::wmma::mma_sync(c_frag[mma_m][mma_n], a_frag[ik][mma_m][mma_k], b_frag[ik][mma_n][mma_k], c_frag[mma_m][mma_n]);
                     }
                 }
             }
@@ -258,8 +356,8 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
 
         __syncthreads();
     }
-    
-    auto sC = neo::make_tensor(shm_c, neo::make_shape(neo::Int<Config::TILE_M>{}, neo::Int<Config::TILE_N>{}), neo::make_stride(neo::Int<Config::TILE_N + PADDING_C>{}, neo::Int<1>{}));
+
+    auto sC = neo::make_tensor(shm_c, neo::make_shape(neo::Int<Config::TILE_M>{}, neo::Int<Config::TILE_N>{}), neo::make_stride(neo::Int<Config::TILE_N + Config::PADDING_C>{}, neo::Int<1>{}));
     using TiledMmaShapeC = typename Config::TiledMmaShapeC;
     auto tiledWrapMmaShapeC = TiledMmaShapeC{};
     auto tiledMmaC = neo::local_tile(sC, tiledWrapMmaShapeC, neo::make_coord(tiledM, tiledN));
@@ -318,12 +416,12 @@ int main() {
     std::uniform_int_distribution<> dis(0, 200);
 
     for (auto& i : h_a) {
-        float n = (dis(gen) - 100.0f) * 0.01f;
+        float n = ((dis(gen) % 200) - 100.0f) * 0.01f;
         i = n;
     }
 
     for (auto& i : h_b) {
-        float n = (dis(gen) - 100.0f) * 0.01f;
+        float n = ((dis(gen) % 200) - 100.0f) * 0.01f;
         i = n;
     }
 
@@ -338,9 +436,11 @@ int main() {
     // cuda warmup
     constexpr int warmup = 100;
     constexpr int nt = 1000;
+    cudaFuncSetAttribute(mma_aligned_128<NeoConfig>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, NeoConfig::ShmSize);
 
     for (int i = 0; i < warmup; ++i) {
-        mma_aligned_128<NeoConfig> << <grid, block >> > (d_c1.data().get(), d_a.data().get(), d_b.data().get(), m, n, k);
+        mma_aligned_128<NeoConfig> << <grid, block, NeoConfig::ShmSize >> > (d_c1.data().get(), d_a.data().get(), d_b.data().get(), m, n, k);
     }
 
     cudaEvent_t start, stop;
@@ -351,7 +451,7 @@ int main() {
     for (int i = 0; i < nt; ++i) {
         cudaEventRecord(start);
 
-        mma_aligned_128<NeoConfig> << <grid, block >> > (d_c1.data().get(), d_a.data().get(), d_b.data().get(), m, n, k);
+        mma_aligned_128<NeoConfig> << <grid, block, NeoConfig::ShmSize >> > (d_c1.data().get(), d_a.data().get(), d_b.data().get(), m, n, k);
 
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
