@@ -194,7 +194,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
                 sAcopyTile.jump(coord);
                 auto gAptr = gAcopyTile.move_at(thrCopyCoordA);
                 auto sAptr = __cvta_generic_to_shared(sAcopyTile.move_at(thrCopyCoordA));
-                asm("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
+                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
                 : "l"(sAptr), "l"(gAptr), "n"(Config::CopyUnitSize));
             }
         }
@@ -209,13 +209,13 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
                 sBcopyTile.jump(coord);
                 auto gBptr = gBcopyTile.move_at(thrCopyCoordB);
                 auto sBptr = __cvta_generic_to_shared(sBcopyTile.move_at(thrCopyCoordB));
-                asm("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
+                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
                 : "l"(sBptr), "l"(gBptr), "n"(Config::CopyUnitSize));
             }
         }
 
-        asm("cp.async.commit_group;\n" ::);
-        asm("cp.async.wait_group 0;\n" ::);
+        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group 0;\n" ::);
 
         __syncthreads();
 

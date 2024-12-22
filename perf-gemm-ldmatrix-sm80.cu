@@ -93,7 +93,7 @@ struct NeoConfig {
     using CopyTiledShapeB = CopyTiledShapeA;
     using CopyThrdShapeB = CopyThrdShapeA;
     using SwizzleB = SwizzleA;
-    using CopyTiledShapeC = decltype(neo::make_shape(neo::Int<CopyRowC>{}, neo::Int<CopyColC* CopyCount>{}));
+    using CopyTiledShapeC = decltype(neo::make_shape(neo::Int<CopyRowC>{}, neo::Int<CopyColC * CopyCount>{}));
     using CopyThrdShapeC = decltype(neo::make_shape(neo::Int<CopyRowC>{}, neo::Int<CopyColC>{}));
 
     static constexpr int PartitionA = 2;
