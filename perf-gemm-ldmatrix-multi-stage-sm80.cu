@@ -110,7 +110,7 @@ struct NeoConfig {
 };
 
 template <typename Config>
-__global__ /*__launch_bounds__(128, 1) */
+__global__ __launch_bounds__(128, 1)
 void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a, const Config::T* __restrict__ b, const int m, const int n, const int k) {
     int idx = threadIdx.x;
     int ix = blockIdx.x;
