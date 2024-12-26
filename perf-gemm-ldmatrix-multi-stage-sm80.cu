@@ -80,12 +80,10 @@ struct NeoConfig {
     static constexpr int CopyColC = TILE_N / CopyCount;
     static constexpr int CopyRowC = Threads / CopyColC;
     static constexpr int Stage = 3;
-    static constexpr int ShmAsizeBase = TILE_M * TILE_K;
-    static constexpr int ShmBsizeBase = TILE_N * TILE_K;
-    static constexpr int ShmAsize = ShmAsizeBase * Stage;
-    static constexpr int ShmBsize = ShmBsizeBase * Stage;
+    static constexpr int ShmAsize = TILE_M * TILE_K;
+    static constexpr int ShmBsize = TILE_N * TILE_K;
     static constexpr int ShmCsize = TILE_M * TILE_N;
-    static constexpr int ShmSize = std::max(ShmAsize + ShmBsize, ShmCsize) * sizeof(T);
+    static constexpr int ShmSize = std::max((ShmAsize + ShmBsize) * Stage, ShmCsize) * sizeof(T);
 
     using CopyTiledShapeA = decltype(neo::make_shape(neo::Int<CopyRowAB>{}, neo::Int<CopyColAB* CopyCount>{}));
     using CopyThrdShapeA = decltype(neo::make_shape(neo::Int<CopyRowAB>{}, neo::Int<CopyColAB>{}));
@@ -201,7 +199,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
                 gAcopyTile.jump(coord);
                 sAcopyTile.jump(coord);
                 auto gAptr = gAcopyTile.move_at(thrCopyCoordA);
-                auto sAptr = __cvta_generic_to_shared(sAcopyTile.base() + istage * Config::ShmAsizeBase + copySwizzleA(sAcopyTile.crx2idx(thrCopyCoordA)));
+                auto sAptr = __cvta_generic_to_shared(sAcopyTile.base() + istage * (Config::ShmAsize + Config::ShmBsize) + copySwizzleA(sAcopyTile.crx2idx(thrCopyCoordA)));
                 asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
                 : "l"(sAptr), "l"(gAptr), "n"(Config::CopyUnitSize));
             }
@@ -216,7 +214,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
                 gBcopyTile.jump(coord);
                 sBcopyTile.jump(coord);
                 auto gBptr = gBcopyTile.move_at(thrCopyCoordB);
-                auto sBptr = __cvta_generic_to_shared(sBcopyTile.base() + istage * Config::ShmAsizeBase + copySwizzleB(sBcopyTile.crx2idx(thrCopyCoordB)));
+                auto sBptr = __cvta_generic_to_shared(sBcopyTile.base() + istage * (Config::ShmAsize + Config::ShmBsize) + copySwizzleB(sBcopyTile.crx2idx(thrCopyCoordB)));
                 asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
                 : "l"(sBptr), "l"(gBptr), "n"(Config::CopyUnitSize));
             }
@@ -244,7 +242,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
 #pragma unroll
             for (int mma_k = 0; mma_k < sOuterMmaShapeA.col_spacing; ++mma_k) {
                 MmaA.jump(neo::make_coord(mma_m, mma_k));
-                unsigned sAptr = __cvta_generic_to_shared(MmaA.base() + ismem_read * Config::ShmAsizeBase + copySwizzleA(MmaA.crx2idx(ldmaCoordA)));
+                unsigned sAptr = __cvta_generic_to_shared(MmaA.base() + ismem_read * (Config::ShmAsize + Config::ShmBsize) + copySwizzleA(MmaA.crx2idx(ldmaCoordA)));
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 { %0, %1, %2, %3 }, [ %4 ];\n"
                     : "=r"(a_frag[ik][mma_m][mma_k][0]), "=r"(a_frag[ik][mma_m][mma_k][1]), "=r"(a_frag[ik][mma_m][mma_k][2]), "=r"(a_frag[ik][mma_m][mma_k][3])
                     : "r"(sAptr)
@@ -257,7 +255,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
 #pragma unroll
             for (int mma_k = 0; mma_k < sOuterMmaShapeB.col_spacing; ++mma_k) {
                 MmaB.jump(neo::make_coord(mma_n, mma_k));
-                unsigned sBptr = __cvta_generic_to_shared(MmaB.base() + ismem_read * Config::ShmBsizeBase + copySwizzleB(MmaB.crx2idx(ldmaCoordB)));
+                unsigned sBptr = __cvta_generic_to_shared(MmaB.base() + ismem_read * (Config::ShmAsize + Config::ShmBsize) + copySwizzleB(MmaB.crx2idx(ldmaCoordB)));
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 { %0, %1, %2, %3 }, [ %4 ];\n"
                     : "=r"(b_frag[ik][mma_n][mma_k][0][0]), "=r"(b_frag[ik][mma_n][mma_k][1][0]), "=r"(b_frag[ik][mma_n][mma_k][0][1]), "=r"(b_frag[ik][mma_n][mma_k][1][1])
                     : "r"(sBptr)
@@ -289,7 +287,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
 #pragma unroll
                 for (int mma_k = 0; mma_k < sOuterMmaShapeA.col_spacing; ++mma_k) {
                     MmaA.jump(neo::make_coord(mma_m, mma_k));
-                    unsigned sAptr = __cvta_generic_to_shared(MmaA.base() + ismem_read * Config::ShmAsizeBase + copySwizzleA(MmaA.crx2idx(ldmaCoordA)));
+                    unsigned sAptr = __cvta_generic_to_shared(MmaA.base() + ismem_read * (Config::ShmAsize + Config::ShmBsize) + copySwizzleA(MmaA.crx2idx(ldmaCoordA)));
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 { %0, %1, %2, %3 }, [ %4 ];\n"
                         : "=r"(a_frag[ik_next][mma_m][mma_k][0]), "=r"(a_frag[ik_next][mma_m][mma_k][1]), "=r"(a_frag[ik_next][mma_m][mma_k][2]), "=r"(a_frag[ik_next][mma_m][mma_k][3])
                         : "r"(sAptr)
@@ -302,7 +300,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
 #pragma unroll
                 for (int mma_k = 0; mma_k < sOuterMmaShapeB.col_spacing; ++mma_k) {
                     MmaB.jump(neo::make_coord(mma_n, mma_k));
-                    unsigned sBptr = __cvta_generic_to_shared(MmaB.base() + ismem_read * Config::ShmBsizeBase + copySwizzleB(MmaB.crx2idx(ldmaCoordB)));
+                    unsigned sBptr = __cvta_generic_to_shared(MmaB.base() + ismem_read * (Config::ShmAsize + Config::ShmBsize) + copySwizzleB(MmaB.crx2idx(ldmaCoordB)));
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 { %0, %1, %2, %3 }, [ %4 ];\n"
                         : "=r"(b_frag[ik_next][mma_n][mma_k][0][0]), "=r"(b_frag[ik_next][mma_n][mma_k][1][0]), "=r"(b_frag[ik_next][mma_n][mma_k][0][1]), "=r"(b_frag[ik_next][mma_n][mma_k][1][1])
                         : "r"(sBptr)
@@ -329,7 +327,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
                             gAcopyTile.jump(coord);
                             sAcopyTile.jump(coord);
                             auto gAptr = gAcopyTile.move_at(thrCopyCoordA);
-                            auto sAptr = __cvta_generic_to_shared(sAcopyTile.base() + ismem_write * Config::ShmAsizeBase + copySwizzleA(sAcopyTile.crx2idx(thrCopyCoordA)));
+                            auto sAptr = __cvta_generic_to_shared(sAcopyTile.base() + ismem_write * (Config::ShmAsize + Config::ShmBsize) + copySwizzleA(sAcopyTile.crx2idx(thrCopyCoordA)));
                             asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
                             : "l"(sAptr), "l"(gAptr), "n"(Config::CopyUnitSize));
                         }
@@ -344,7 +342,7 @@ void mma_aligned_128(Config::T* __restrict__ c, const Config::T* __restrict__ a,
                             gBcopyTile.jump(coord);
                             sBcopyTile.jump(coord);
                             auto gBptr = gBcopyTile.move_at(thrCopyCoordB);
-                            auto sBptr = __cvta_generic_to_shared(sBcopyTile.base() + ismem_write * Config::ShmBsizeBase + copySwizzleB(sBcopyTile.crx2idx(thrCopyCoordB)));
+                            auto sBptr = __cvta_generic_to_shared(sBcopyTile.base() + ismem_write * (Config::ShmAsize + Config::ShmBsize) + copySwizzleB(sBcopyTile.crx2idx(thrCopyCoordB)));
                             asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :
                             : "l"(sBptr), "l"(gBptr), "n"(Config::CopyUnitSize));
                         }
