@@ -4,10 +4,10 @@
 
 namespace neo {
 
-template <typename T1, typename T2, typename T3>
+template <typename T1, typename T2, typename T3, typename T4>
 class Tensor {
 public:
-    NEO_HOST_DEVICE Tensor(T1 ptr_base, int offset, T2 shape, T3 stride)
+    NEO_HOST_DEVICE Tensor(T1 ptr_base, T2 offset, T3 shape, T4 stride)
     :m_ptr_base(ptr_base)
     ,m_offset_base(offset)
     ,m_shape(shape)
@@ -71,19 +71,19 @@ public:
 
 private:
     const T1 m_ptr_base;
-    const int m_offset_base;
+    T2 m_offset_base;
     int m_offset = 0;
-    T2 m_shape;
-    T3 m_stride;
+    T3 m_shape;
+    T4 m_stride;
 };
 
 template <typename T1, typename T2, typename T3>
-NEO_HOST_DEVICE constexpr Tensor<T1, T2, T3> make_tensor(T1 ptr_base, T2 shape, T3 stride) {
-    return { ptr_base, 0, shape, stride };
+NEO_HOST_DEVICE constexpr Tensor<T1, neo::Int<0>, T2, T3> make_tensor(T1 ptr_base, T2 shape, T3 stride) {
+    return { ptr_base, neo::Int<0>{}, shape, stride };
 }
 
 template <typename T1, typename T2, typename T3>
-NEO_HOST_DEVICE constexpr Tensor<T1, T2, T3> make_tensor(T1 ptr_base, int offset, T2 shape, T3 stride) {
+NEO_HOST_DEVICE constexpr Tensor<T1, int, T2, T3> make_tensor(T1 ptr_base, int offset, T2 shape, T3 stride) {
     return { ptr_base, offset, shape, stride };
 }
 
