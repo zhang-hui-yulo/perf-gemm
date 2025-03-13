@@ -1,8 +1,9 @@
-﻿
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
 #include <cute/tensor.hpp>
+
+#include <cublas_v2.h>
 
 #include "cutlass/util/GPU_Clock.hpp"
 
@@ -10,17 +11,17 @@ template <
     class ProblemShape, class CtaTiler,
     class TA, class AStride, class ASmemLayout, class TiledCopyA,
     class TB, class BStride, class BSmemLayout, class TiledCopyB,
-    class TC, class CStride, class CSmemLayout, //class TiledCopyC,
-    class TiledMma, class MmaCopyA, class MmaCopyB, //class MmaCopyC,
+    class TC, class CStride, class CSmemLayout, class TiledCopyC,
+    class TiledMma, class MmaCopyA, class MmaCopyB, class MmaCopyC,
     class Alpha, class Beta>
 __global__ static
 __launch_bounds__(decltype(size(TiledMma{}))::value)
-void gemm_device_2stage_aligned(
+void gemm_device_twostage_aligned(
     ProblemShape shape_MNK, CtaTiler cta_tiler,
     TA const* A, AStride dA, ASmemLayout sA_layout, TiledCopyA copy_a,
     TB const* B, BStride dB, BSmemLayout sB_layout, TiledCopyB copy_b,
-    TC* C, CStride dC, CSmemLayout sC_layout, //TiledCopyC copy_c,
-    TiledMma mma, MmaCopyA copy_mma_a, MmaCopyB copy_mma_b, //MmaCopyC copy_mma_c,
+    TC* C, CStride dC, CSmemLayout sC_layout, TiledCopyC copy_c,
+    TiledMma mma, MmaCopyA copy_mma_a, MmaCopyB copy_mma_b, MmaCopyC copy_mma_c,
     Alpha alpha, Beta beta) {
     using namespace cute;
 
@@ -193,9 +194,55 @@ void gemm_device_2stage_aligned(
         } // k_block
     } // k_tile
 
-    if (thread(31)) {
-        print_tensor(tCrC);
+#if 0
+    if (thread(0)) {
+        print_tensor(tCrC); printf("\n");
     }
+#endif
+
+    // Epilogue
+
+    // Shared memory buffers
+    __shared__ TC smemC[cosize_v<CSmemLayout>];
+    Tensor sC = make_tensor(make_smem_ptr(smemC), sC_layout);            // (BLK_M,BLK_N)
+
+    // Define copy for smem to gmem
+    ThrCopy thr_copy_c = copy_c.get_slice(threadIdx.x);
+    Tensor tDgC = thr_copy_c.partition_S(gC);                            // (CPY,CPY_N,CPY_K,k)
+    Tensor tDsC = thr_copy_c.partition_D(sC);                            // (CPY,CPY_N,CPY_K)
+
+    CUTE_STATIC_ASSERT_V(size<1>(tDgC) == size<1>(tDsC));                // CPY_M
+    CUTE_STATIC_ASSERT_V(size<2>(tDgC) == size<2>(tDsC));                // CPY_N
+
+#if 0
+    if (thread0()) {
+        print("tDgC : "); print(tDgC); print("\n");
+        print("tDsC : "); print(tDsC); print("\n");
+    }
+#endif
+
+    // Copy gmem to smem
+    copy(copy_c, tDgC, tDsC);
+
+    __syncthreads();
+
+    // Define mma copy
+    Tensor tDrC = thr_mma.partition_fragment_C(gC);           // (MMA, MMA_M, MMA_N)
+
+    ThrCopy thr_mma_copy_c = copy_mma_c.get_slice(threadIdx.x);
+    Tensor tCsC = thr_mma_copy_c.partition_S(sC);             // (CPY, CPY_M, CPY_N)
+    Tensor tDrC_view = thr_mma_copy_c.retile_D(tDrC);         // (CPY, CPY_M, CPY_N)
+
+    copy(copy_mma_c, tCsC, tDrC_view);
+
+    axpby(alpha, tCrC, beta, tDrC);
+
+    copy(copy_mma_c, tDrC_view, tCsC);
+
+    __syncthreads();
+
+    // Copy smem to gmem
+    copy(copy_c, tDsC, tDgC);
 
 #endif
 }
@@ -336,10 +383,13 @@ gemm_tn(
 
     TiledCopy copyA = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TA>{},
         Layout<Shape<_32, _4>, Stride<_4, _1>>{}, // Thr layout 32x8 k-major
-        Layout<Shape< _1, _8>>{});              // Val layout  1x1
+        Layout<Shape< _1, _8>>{});                // Val layout  1x1
     TiledCopy copyB = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TB>{},
         Layout<Shape<_32, _4>, Stride<_4, _1>>{}, // Thr layout 32x8 k-major
-        Layout<Shape< _1, _8>>{});              // Val layout  1x1
+        Layout<Shape< _1, _8>>{});                // Val layout  1x1
+    TiledCopy copyC = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TC>{},
+        Layout<Shape<_16, _8>>{},                 // Thr layout 32x8 k-major
+        Layout<Shape< _8, _1>>{});                // Val layout  1x1
 
     // Define the mma
     using mma_traits = MMA_Traits<SM80_16x8x16_F16F16F16F16_TN>;
@@ -363,6 +413,7 @@ gemm_tn(
     // mma copy
     TiledCopy mmaCopyA = make_tiled_copy_A(Copy_Atom<Copy_Traits<SM75_U32x4_LDSM_N>, TA>{}, mmaC);
     TiledCopy mmaCopyB = make_tiled_copy_B(Copy_Atom<Copy_Traits<SM75_U32x4_LDSM_N>, TB>{}, mmaC);
+    TiledCopy mmaCopyC = make_tiled_copy_C(Copy_Atom<Copy_Traits<UniversalCopy<uint16_t>>, TC>{}, mmaC);
 
 #if 0
     print(copyA);
@@ -380,12 +431,12 @@ gemm_tn(
     dim3 dimGrid(size(ceil_div(M, bM)),
                  size(ceil_div(N, bN)));
 
-    gemm_device_2stage_aligned <<<dimGrid, dimBlock, 0, stream>>>
+    gemm_device_twostage_aligned <<<dimGrid, dimBlock, 0, stream>>>
         (prob_shape, cta_tiler,
             A, dA, sA, copyA,
             B, dB, sB, copyB,
-            C, dC, sC,
-            mmaC, mmaCopyA, mmaCopyB,
+            C, dC, sC, copyC,
+            mmaC, mmaCopyA, mmaCopyB, mmaCopyC,
             alpha, beta);
 }
 
@@ -447,11 +498,11 @@ int main(int argc, char** argv) {
 
     using TA = cute::half_t;
     using TB = cute::half_t;
-    using TC = float;
+    using TC = cute::half_t;
     using TI = cute::half_t;
 
     TI alpha(1.0f);
-    TI beta(0.0f);
+    TI beta(10.0f);
 
     std::cout << "M = " << m << std::endl;
     std::cout << "N = " << n << std::endl;
@@ -461,14 +512,16 @@ int main(int argc, char** argv) {
     thrust::host_vector<TA> h_A(m * k);
     thrust::host_vector<TB> h_B(n * k);
     thrust::host_vector<TC> h_C(m * n);
+    thrust::host_vector<TC> h_C1 = h_C;
 
     for (int j = 0; j < m * k; ++j) h_A[j] = j / 1000.0f;
-    for (int j = 0; j < n * k; ++j) h_B[j] = j / 1000.0f;
-    for (int j = 0; j < m * n; ++j) h_C[j] = static_cast<TC>(-1);
+    for (int j = 0; j < n * k; ++j) h_B[j] = (j + 1) / 1000.0f;
+    for (int j = 0; j < m * n; ++j) h_C[j] = (j + 2) / 1000.0f;
 
     thrust::device_vector<TA> d_A = h_A;
     thrust::device_vector<TB> d_B = h_B;
     thrust::device_vector<TC> d_C = h_C;
+    thrust::device_vector<TC> d_C1 = h_C;
 
     double gflops = (2.0 * m * n * k) * 1e-9;
 
@@ -506,7 +559,7 @@ int main(int argc, char** argv) {
         beta,
         d_C.data().get(), ldC);
     CUTE_CHECK_LAST();
-    thrust::host_vector<TC> cute_result = d_C;
+    h_C = d_C;
 
     // Timing iterations
     timer.start();
@@ -521,6 +574,30 @@ int main(int argc, char** argv) {
     double cute_time = timer.seconds() / timing_iterations;
     CUTE_CHECK_LAST();
     printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time * 1000);
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+
+    cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        m, n, k,
+        (half*)&alpha,
+        (half*)d_A.data().get(), k,
+        (half*)d_B.data().get(), k,
+        (half*)&beta,
+        (half*)d_C1.data().get(), m);
+
+    cublasDestroy(handle);
+
+    h_C1 = d_C1;
+
+    auto tC_host = cute::make_tensor(h_C.data(), cute::make_shape(m, n), cute::make_stride(1, m));
+    auto tC1_host = cute::make_tensor(h_C1.data(), cute::make_shape(m, n), cute::make_stride(1, m));
+    auto tile = cute::make_tile(min(8, m), min(8, n));
+    auto t32x32 = local_tile(tC_host, tile, cute::make_coord(0, 0));
+    auto t32x32_cublas = local_tile(tC1_host, tile, cute::make_coord(0, 0));
+
+    cute::print_tensor(t32x32); printf("\n");
+    cute::print_tensor(t32x32_cublas); printf("\n");
 
     return 0;
 }
