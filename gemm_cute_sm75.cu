@@ -9,12 +9,45 @@
 
 
 template <
+    class Shape, class SplitkShape, class SplitkCoord,
+    class CtaTiler, class CtaCoord, class CtaStep, class ThrCopy>
+CUTE_HOST_DEVICE constexpr
+auto
+make_pred_splitk(
+    Shape const& shape, SplitkShape const& splitk_shape, SplitkCoord const& splitk_coord,
+    CtaTiler const& cta_tiler, CtaCoord const& cta_coord, CtaStep const& cta_step, ThrCopy const& thr_copy) {
+    using namespace cute;
+
+    Tensor m = make_identity_tensor(shape);
+    Tensor mSplit = local_tile(m, splitk_shape, splitk_coord);
+    Tensor cSplit = local_tile(mSplit, cta_tiler, cta_coord, cta_step);
+    return thr_copy.partition_S(cSplit);
+}
+
+template <
+    class Shape,
+    class CtaTiler, class CtaCoord, class CtaStep,
+    class ThrCopy>
+CUTE_HOST_DEVICE constexpr
+auto
+make_pred(
+    Shape const& shape,
+    CtaTiler const& cta_tiler, CtaCoord const& cta_coord, CtaStep const& cta_step,
+    ThrCopy const& thr_copy) {
+    using namespace cute;
+
+    Tensor m = make_identity_tensor(shape);
+    Tensor c = local_tile(m, cta_tiler, cta_coord, cta_step);
+    return thr_copy.partition_S(c);
+}
+
+template <
     class ProblemShape, class SplitShape, class CtaTiler,
     class TA, class AStride, class ASmemLayout, class TiledCopyA,
     class TB, class BStride, class BSmemLayout, class TiledCopyB,
     class TC, class CStride, class CSmemLayout, class TiledCopyC, class TiledCopyDestC,
     class TiledMma, class MmaCopyA, class MmaCopyB, class MmaCopyC,
-    class Alpha, class Beta>
+    class Alpha, class Beta, bool CheckA = true, bool CheckB = true, bool CheckC = true>
 __global__ static
 __launch_bounds__(decltype(size(TiledMma{}))::value)
 void gemm_device_twostage_aligned_splitk(
@@ -58,7 +91,7 @@ void gemm_device_twostage_aligned_splitk(
     Tensor mC = make_tensor(make_gmem_ptr(C), select<0, 1>(shape_MNK), dC); // (M,N)
 
     // Represent the split tensors
-    auto splitk_coord = make_coord(blockIdx.x, blockIdx.y, blockIdx.z);                    // (m,n,splitk)
+    auto splitk_coord = make_coord(_0{}, _0{}, blockIdx.z);                                // (m,n,splitk)
     Tensor mSplitA = local_tile(mA, select<0, 2>(shape_MNSK), select<0, 2>(splitk_coord)); // (M, SK)
     Tensor mSplitB = local_tile(mB, select<1, 2>(shape_MNSK), select<1, 2>(splitk_coord)); // (N, SK)
 
@@ -97,9 +130,53 @@ void gemm_device_twostage_aligned_splitk(
     CUTE_STATIC_ASSERT_V(size<2>(tBgB) == size<2>(tBsB));                // CPY_K
     CUTE_STATIC_ASSERT_V(size<2>(tBgB) == size<2>(tBrB));                // CPY_K
 
+    using PredAType = decltype(
+        make_pred_splitk(
+            shape(mA), select<0, 2>(shape_MNSK), select<0, 2>(splitk_coord),
+            cta_tiler, cta_coord, Step<_1, X, _1>{}, thr_copy_a)
+        );
+    using PredBType = decltype(
+        make_pred_splitk(
+            shape(mB), select<1, 2>(shape_MNSK), select<1, 2>(splitk_coord),
+            cta_tiler, cta_coord, Step< X, _1, _1>{}, thr_copy_b)
+        );
+    PredAType tAcA;
+    PredBType tBcB;
+
     // Copy gmem to rmem for k_tile=0
-    copy(copy_a, tAgA(_, _, _, 0), tArA);
-    copy(copy_b, tBgB(_, _, _, 0), tBrB);
+    if (!CheckA) {
+        copy(copy_a, tAgA(_, _, _, 0), tArA);
+    } else {
+        tAcA = make_pred_splitk(
+            shape(mA), select<0, 2>(shape_MNSK), select<0, 2>(splitk_coord),
+            cta_tiler, cta_coord, Step<_1, X, _1>{}, thr_copy_a);
+        Tensor tAcA_ = tAcA(_0{}, _, _, _0{});
+
+        // Copy -- All elements in CPY-mode must be predicated symmetrically 
+        auto tApA = [&](auto... coords) {
+            return elem_less(tAcA_(coords...), shape(mA));
+        };
+
+        clear(tArA);
+        copy_if(copy_a, tApA, tAgA(_, _, _, 0), tArA);
+    }
+
+    if (!CheckB) {
+        copy(copy_b, tBgB(_, _, _, 0), tBrB);
+    } else {
+        tBcB = make_pred_splitk(
+            shape(mB), select<1, 2>(shape_MNSK), select<1, 2>(splitk_coord),
+            cta_tiler, cta_coord, Step< X, _1, _1>{}, thr_copy_b);
+        Tensor tBcB_ = tBcB(_0{}, _, _, _0{});
+
+        // Copy -- All elements in CPY-mode must be predicated symmetrically 
+        auto tBpB = [&](auto... coords) {
+            return elem_less(tBcB_(coords...), shape(mB));
+        };
+
+        clear(tBrB);
+        copy_if(copy_b, tBpB, tBgB(_, _, _, 0), tBrB);
+    }
     //
     // Define A/B partitioning and C accumulators
     //
@@ -193,8 +270,33 @@ void gemm_device_twostage_aligned_splitk(
             if (k_block == 0) {
                 // Copy gmem to rmem for k_tile+1
                 int k_tile_next = (k_tile + 1 < K_TILE_MAX) ? k_tile + 1 : k_tile;
-                copy(copy_a, tAgA(_, _, _, k_tile_next), tArA);
-                copy(copy_b, tBgB(_, _, _, k_tile_next), tBrB);
+                if (!CheckA) {
+                    copy(copy_a, tAgA(_, _, _, k_tile_next), tArA);
+                } else {
+                    Tensor tAcA_ = tAcA(_0{}, _, _, k_tile_next);
+
+                    // Copy -- All elements in CPY-mode must be predicated symmetrically 
+                    auto tApA = [&](auto... coords) {
+                        return elem_less(tAcA_(coords...), shape(mA));
+                        };
+
+                    clear(tArA);
+                    copy_if(copy_a, tApA, tAgA(_, _, _, k_tile_next), tArA);
+                }
+
+                if (!CheckB) {
+                    copy(copy_b, tBgB(_, _, _, k_tile_next), tBrB);
+                } else {
+                    Tensor tBcB_ = tBcB(_0{}, _, _, k_tile_next);
+
+                    // Copy -- All elements in CPY-mode must be predicated symmetrically 
+                    auto tBpB = [&](auto... coords) {
+                        return elem_less(tBcB_(coords...), shape(mB));
+                    };
+
+                    clear(tBrB);
+                    copy_if(copy_b, tBpB, tBgB(_, _, _, k_tile_next), tBrB);
+                }
             }
 
             // Thread-level register gemm for k_block
@@ -203,7 +305,7 @@ void gemm_device_twostage_aligned_splitk(
     } // k_tile
 
 #if 0
-    if (thread(0, 0)) {
+    if (thread(0, 1)) {
         print_tensor(tCrC); printf("\n");
     }
 #endif
@@ -230,9 +332,7 @@ void gemm_device_twostage_aligned_splitk(
         }
 #endif
         // Copy gmem to smem
-        if (blockIdx.z == 0) {
-            copy(copy_c, tDgC, tDsC);
-        }
+        copy(copy_c, tDgC, tDsC);
 
         __syncthreads();
     }
@@ -259,14 +359,29 @@ void gemm_device_twostage_aligned_splitk(
 
     // Define copy for smem to gmem
     ThrCopy thr_copy_dest_c = copy_dest_c.get_slice(threadIdx.x);
-    Tensor tDgDestC = thr_copy_dest_c.partition_S(gC);                   // (CPY,CPY_N,CPY_K,k)
-    Tensor tDsDestC = thr_copy_dest_c.partition_D(sC);                   // (CPY,CPY_N,CPY_K)
+    Tensor tDsDestC = thr_copy_dest_c.partition_S(sC);                   // (CPY,CPY_N,CPY_K,k)
+    Tensor tDgDestC = thr_copy_dest_c.partition_D(gC);                   // (CPY,CPY_N,CPY_K)
 
     CUTE_STATIC_ASSERT_V(size<1>(tDgDestC) == size<1>(tDsDestC));        // CPY_M
     CUTE_STATIC_ASSERT_V(size<2>(tDgDestC) == size<2>(tDsDestC));        // CPY_N
 
     // Copy smem to gmem
-    copy(copy_dest_c, tDsDestC, tDgDestC);
+    if (!CheckC) {
+        copy(copy_dest_c, tDsDestC, tDgDestC);
+    } else {
+        auto tCcC = make_pred(
+            shape(mC),
+            cta_tiler, cta_coord, Step<_1, _1, X>{},
+            thr_copy_dest_c);
+        Tensor tCcC_ = tCcC(_0{}, _, _);
+
+        // Copy -- All elements in CPY-mode must be predicated symmetrically 
+        auto tCpC = [&](auto... coords) {
+            return elem_less(tCcC_(coords...), shape(mC));
+        };
+
+        copy_if(copy_dest_c, tCpC, tDsDestC, tDgDestC);
+    }
 
 #endif
 }
@@ -674,7 +789,7 @@ gemm_tn(
     auto M = int(m);
     auto N = int(n);
     auto K = int(k);
-    auto SpiltK = int(2);
+    auto SpiltK = int(4);
     auto prob_shape = make_shape(M, N, K);                     // (M, N, K)
     auto split_shape = make_shape(M, N, K / SpiltK);           // (M, N, SpiltK)
 
@@ -690,11 +805,17 @@ gemm_tn(
     auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
 
     // Define the smem layouts (static)
-    auto sA = make_layout(make_shape(bM, bK),
-        make_stride(bK, Int<1>{}));        // (m,k) -> smem_idx; padded m-major
-    auto sB = make_layout(make_shape(bN, bK),
-        make_stride(bK, Int<1>{}));        // (n,k) -> smem_idx; padded n-major
-    auto sC = make_layout(make_shape(bM, bN));                        // (m,n) -> smem_idx
+    auto sA = composition(
+        Swizzle<3, 3, 3>{},
+        make_layout(make_shape(bM, bK),
+        make_stride(bK, Int<1>{})));        // (m,k) -> smem_idx; padded m-major
+    auto sB = composition(
+        Swizzle<3, 3, 3>{},
+        make_layout(make_shape(bN, bK),
+        make_stride(bK, Int<1>{})));        // (n,k) -> smem_idx; padded n-major
+    auto sC = composition(
+        Swizzle<3, 3, 3>{},
+        make_layout(make_shape(bM, bN)));                        // (m,n) -> smem_idx
 
     // Define the thread layouts (static)
 
@@ -704,7 +825,7 @@ gemm_tn(
     TiledCopy copyB = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TB>{},
         Layout<Shape<_32, _4>, Stride<_4, _1>>{}, // Thr layout 32x8 k-major
         Layout<Shape< _1, _8>>{});                // Val layout  1x1
-    TiledCopy copyC = make_tiled_copy(Copy_Atom<UniversalCopyClearSrc<uint128_t>, TC>{},
+    TiledCopy copyC = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TC>{},
         Layout<Shape<_16, _8>>{},  // Thr layout 32x8 k-major
         Layout<Shape< _8, _1>>{}); // Val layout  1x1
     TiledCopy copyDestC = make_tiled_copy(Copy_Atom<UniversalCopyAtomicAdd<half2>, TC>{},
@@ -750,7 +871,7 @@ gemm_tn(
     dim3 dimBlock(size(mmaC));
     dim3 dimGrid(size(ceil_div(M, bM)),
                  size(ceil_div(N, bN)),
-                 SpiltK);
+                 size(ceil_div(K, get<2>(split_shape))));
 
     gemm_device_twostage_aligned_splitk <<<dimGrid, dimBlock, 0, stream>>> (
         prob_shape, split_shape, cta_tiler,
@@ -783,6 +904,14 @@ gemm(
 }
 
 
+template <typename T>
+void gen_rand_data(T* data, int n) {
+    for (int i = 0; i < n; ++i) {
+        float v = (rand() % 200 - 100) * 0.01;
+        data[i] = v;
+    }
+}
+
 int main(int argc, char** argv) {
     cudaDeviceProp props;
     cudaError_t error = cudaGetDeviceProperties(&props, 0);
@@ -797,15 +926,15 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    int m = 128;
+    int m = 4096;
     if (argc >= 2)
         sscanf(argv[1], "%d", &m);
 
-    int n = 128;
+    int n = 338;
     if (argc >= 3)
         sscanf(argv[2], "%d", &n);
 
-    int k = 128;
+    int k = 4096;
     if (argc >= 4)
         sscanf(argv[3], "%d", &k);
 
@@ -822,8 +951,8 @@ int main(int argc, char** argv) {
     using TC = cute::half_t;
     using TI = cute::half_t;
 
-    TI alpha(2.0f);
-    TI beta(3.0f);
+    TI alpha(1.0f);
+    TI beta(0.0f);
 
     std::cout << "M = " << m << std::endl;
     std::cout << "N = " << n << std::endl;
@@ -832,21 +961,24 @@ int main(int argc, char** argv) {
 
     thrust::host_vector<TA> h_A(m * k);
     thrust::host_vector<TB> h_B(n * k);
-    thrust::host_vector<TC> h_C(m * n);
+    thrust::host_vector<TC> h_C(m * n, TC(0));
     thrust::host_vector<TC> h_C1 = h_C;
 
-    for (int j = 0; j < m * k; ++j) h_A[j] = j / 1000.0f;
-    for (int j = 0; j < n * k; ++j) h_B[j] = (j + 1) / 1000.0f;
-    for (int j = 0; j < m * n; ++j) h_C[j] = (j + 2) / 1000.0f;
+    //for (int j = 0; j < m * k; ++j) h_A[j] = (j / 1000.0f);
+    //for (int j = 0; j < n * k; ++j) h_B[j] = ((j + 1) / 1000.0f);
+    //for (int j = 0; j < m * n; ++j) h_C[j] = ((j + 1) / 1000.0f);
+    gen_rand_data(h_A.data(), h_A.size());
+    gen_rand_data(h_B.data(), h_B.size());
+    //gen_rand_data(h_C.data(), h_C.size());
 
     thrust::device_vector<TA> d_A = h_A;
     thrust::device_vector<TB> d_B = h_B;
     thrust::device_vector<TC> d_C = h_C;
-    thrust::device_vector<TC> d_C1 = h_C;
+    thrust::device_vector<TC> d_C1 = h_C1;
 
-    double gflops = (2.0 * m * n * k) * 1e-9;
+    double gflops = (2.0 * m * n * k) * 1e-12;
 
-    const int timing_iterations = 0;
+    const int timing_iterations = 10;
     GPU_Clock timer;
 
     int ldA = 0, ldB = 0, ldC = m;
@@ -880,11 +1012,11 @@ int main(int argc, char** argv) {
         beta,
         d_C.data().get(), ldC);
     CUTE_CHECK_LAST();
-    h_C = d_C;
 
     // Timing iterations
     timer.start();
     for (int i = 0; i < timing_iterations; ++i) {
+        //d_C = h_C;
         gemm(transA, transB, m, n, k,
             alpha,
             d_A.data().get(), ldA,
@@ -894,7 +1026,7 @@ int main(int argc, char** argv) {
     }
     double cute_time = timer.seconds() / timing_iterations;
     CUTE_CHECK_LAST();
-    printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time * 1000);
+    printf("CUTE_GEMM:     [%6.1f]TFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time * 1000);
 
     cublasHandle_t handle;
     cublasCreate(&handle);
@@ -907,8 +1039,27 @@ int main(int argc, char** argv) {
         (half*)&beta,
         (half*)d_C1.data().get(), m);
 
+
+    // Timing iterations
+    timer.start();
+    for (int i = 0; i < timing_iterations; ++i) {
+        //d_C1 = h_C1;
+        cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            m, n, k,
+            (half*)&alpha,
+            (half*)d_A.data().get(), k,
+            (half*)d_B.data().get(), k,
+            (half*)&beta,
+            (half*)d_C1.data().get(), m);
+    }
+    cute_time = timer.seconds() / timing_iterations;
+    CUTE_CHECK_LAST();
+    printf("CUBLAS_GEMM:     [%6.1f]TFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time * 1000);
+
+
     cublasDestroy(handle);
 
+    h_C = d_C;
     h_C1 = d_C1;
 
     auto tC_host = cute::make_tensor(h_C.data(), cute::make_shape(m, n), cute::make_stride(1, m));
@@ -919,6 +1070,16 @@ int main(int argc, char** argv) {
 
     cute::print_tensor(t32x32); printf("\n");
     cute::print_tensor(t32x32_cublas); printf("\n");
+
+    float threshold = 0.1f;
+    for (int i = 0; i < h_C.size(); ++i) {
+        float v1 = h_C[i];
+        float v2 = h_C1[i];
+        if (fabs(v2 - v1) > threshold) {
+            printf("idx:%i v1 = %f, v2 = %f\n", i, v1, v2);
+            break;
+        }
+    }
 
     return 0;
 }
