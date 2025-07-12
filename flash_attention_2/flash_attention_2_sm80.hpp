@@ -1,10 +1,78 @@
-#pragma once
+﻿#pragma once
 
 #include "flash.hpp"
 #include "kernel_traits.hpp"
+#include "utils.hpp"
 
+#define M_LOG2E    1.44269504088896340736
 
 namespace flash {
+
+template <typename Fragment>
+inline __device__ auto convert_type_f32_to_f16(Fragment const &acc_fp32) {
+    Tensor acc_fp16 = make_tensor<cute::half_t>(shape(acc_fp32));
+    {
+        Tensor acc_fp32x2 = recast< float2>(acc_fp32);
+        Tensor acc_fp16x2 = recast<__half2>(acc_fp16);
+        for (int i = 0; i < size(acc_fp32x2); ++i) { acc_fp16x2(i) = __float22half2_rn(acc_fp32x2(i)); }
+    }
+    return acc_fp16;
+}
+
+template<typename MMA_traits, typename Layout>
+inline __device__ auto convert_layout_rowcol_Aregs(Layout rowcol_layout) {
+    using X = Underscore;
+    static_assert(decltype(size<0, 0>(rowcol_layout))::value == 2);
+    static_assert(decltype(size<1, 0>(rowcol_layout))::value == 2);
+    constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
+    static_assert(mma_shape_K == 8 || mma_shape_K == 16);
+    constexpr int MMA_N_divisor = mma_shape_K == 8 ? 1 : 2;
+    auto l = logical_divide(rowcol_layout, Shape<X, Shape<X, Int<MMA_N_divisor>>>{});  // ((2, MMA_M), (2, (2, MMA_N / 2)))
+    // TD [2023-08-13]: Same error as above on Cutlass 3.2
+    // return make_layout(make_layout(get<1, 0>(l), get<0, 0>(l), get<1, 1, 0>(l)),
+    //                    get<0, 1>(l),
+    //                    get<1, 1, 1>(l));
+    return make_layout(make_layout(get<0>(get<1>(l)), get<0>(get<0>(l)), get<0>(get<1>(get<1>(l)))),
+        get<1>(get<0>(l)),
+        get<1>(get<1>(get<1>(l))));
+};
+
+template <int kBlockM, int kBlockN, int kNWarps,typename Engine, typename Layout>
+inline __device__ void mask_within_nblock(Tensor<Engine, Layout> &tensor, const int m_block, const int nbi) {
+    // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
+    static_assert(Layout::rank == 2, "Only support 2D Tensor");
+    const int lane_id = threadIdx.x % 32;
+    const int col_idx_offset = kBlockN * nbi + (lane_id % 4) * 2;
+
+    const int nrow_group = threadIdx.x / 32;
+    const int row_idx_offset = kBlockM * m_block + lane_id / 4 + nrow_group * 16 /* 2*8 */;
+    // (2, nrow), 2*8 for each
+    const int group_stride = kNWarps * 16;
+
+    #pragma unroll
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+        const int col_idx_base = col_idx_offset + nj * 8;
+        #pragma unroll
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            const int col_idx = col_idx_base + j;
+
+            // Without the "make_coord" we get wrong results
+            // for nrow(2, MMA_M)
+            #pragma unroll
+            for (int mi = 0; mi < size<0, 0>(tensor); ++mi) {
+
+                #pragma unroll
+                for (int mj = 0; mj < size<0, 1>(tensor); ++mj) {
+                    const int row_idx = row_idx_offset + mi * 8 + mj * group_stride;
+                    if (col_idx > row_idx) {
+                      tensor(make_coord(mi, mj), make_coord(j, nj)) = -INFINITY;
+                    }
+                }
+            }
+
+        }
+    }
+}
 
 // Shared Storage with Aligned addresses.
 template <class ElementType, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV>
@@ -30,6 +98,117 @@ inline __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const
         for (int k = 0; k < size<2>(S); ++k) {
             cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
         }
+    }
+}
+
+template<typename Layout>
+inline __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
+    // TD [2023-08-13]: Idk why but get<0, 1>(l) doesn't work for Cutlass 3.2, I'm getting
+    // "int_tuple.hpp(74): error: conversion to inaccessible base class"
+    // return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+    return make_layout(make_layout(get<1>(get<0>(l)), get<1>(l)), make_layout(get<0>(get<0>(l)), get<2>(l)));
+}
+
+// Apply the exp to all the elements.
+template <bool Scale_max = true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
+inline __device__ void scale_apply_exp2(Tensor<Engine0, Layout0>& tensor, Tensor<Engine1, Layout1> const& max, const float scale) {
+    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
+    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
+    CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(tensor); ++mi) {
+        // If max is -inf, then all elements must have been -inf (possibly due to masking).
+        // We don't want (-inf - (-inf)) since that would give NaN.
+        // If we don't have float around M_LOG2E the multiplication is done in fp64.
+        const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * (Scale_max ? scale : float(M_LOG2E));
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(tensor); ++ni) {
+            // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
+            // max * log_2(e)) This allows the compiler to use the ffma
+            // instruction instead of fadd and fmul separately.
+            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+        }
+    }
+}
+
+template<bool Is_first, typename Tensor0, typename Tensor1, typename Tensor2>
+inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, Tensor1 &scores_sum,
+                                         Tensor2 &acc_o, float softmax_scale_log2) {
+    if (Is_first) {
+        reduce_max</*zero_init=*/true>(scores, scores_max);
+        flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
+        reduce_sum(scores, scores_sum);
+    } else {
+        Tensor scores_max_prev = make_fragment_like(scores_max);
+        cute::copy(scores_max, scores_max_prev);
+        reduce_max</*zero_init=*/false>(scores, scores_max);
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        #pragma unroll
+        for (int mi = 0; mi < size(scores_max); ++mi) {
+            float scores_max_cur = scores_max(mi);
+            float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+            scores_sum(mi) *= scores_scale;
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
+        }
+        flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
+
+        Tensor scores_sum_cur = make_fragment_like(scores_sum);
+
+        reduce_sum(scores, scores_sum_cur);
+        #pragma unroll
+        for (int mi = 0; mi < size(scores_sum); ++mi) { scores_sum(mi) += scores_sum_cur(mi); }
+    }
+}
+
+template<typename Tensor0, typename Tensor1,
+         typename Tensor2, typename Tensor3, typename Tensor4,
+         typename TiledMma, typename TiledCopyA, typename TiledCopyB,
+         typename ThrCopyA, typename ThrCopyB>
+inline __device__ void gemm_smem(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
+                            Tensor4 const& tCsB, TiledMma tiled_mma,
+                            TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
+                            ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B) {
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    // NOTE: s -> reg
+    cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{}));
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1));
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+
+template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+    typename TiledMma, typename TiledCopy, typename ThrCopy>
+inline __device__ void gemm_A_in_regs(Tensor0& acc, Tensor1& tCrA, Tensor2& tCrB, Tensor3 const& tCsB,
+    TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+    ThrCopy smem_thr_copy_B) {
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
 }
 
@@ -173,6 +352,46 @@ __global__ void flash_attention_v2_cute_kernel(const Params params) {
         tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
         flash::copy(gmem_tiled_copy_QKV, tVgV, tVsV);
         cute::cp_async_fence();
+
+        flash::gemm_smem(rAccScore, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+            smem_thr_copy_Q, smem_thr_copy_K
+        );
+
+        Tensor scores = make_tensor(rAccScore.data(), flash::convert_layout_acc_rowcol(rAccScore.layout())); // (MMA_M, MMA_N)
+
+        // NOTE: 2. mask within N BLOCKs
+        if (Is_causal == true && nbi * kBlockN >= seqlen_q_start) {
+            flash::mask_within_nblock<kBlockM, kBlockN, kNWarps>(scores, m_block, nbi);
+        }
+
+        // wait gV -> sV
+        flash::cp_async_wait<0>();
+        __syncthreads();
+
+        // advance K
+        if (nbi != n_block_max - 1) {
+            gK = local_tile(K, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(nbi + 1, _));
+            tKgK = gmem_thr_copy_QKV.partition_S(gK(_, _, 0));
+            flash::copy(gmem_tiled_copy_QKV, tKgK, tKsK);
+            cute::cp_async_fence();
+        }
+
+        // softmax
+        nbi == 0 ? flash::softmax_rescale_o</*Is_first=*/true>(scores, scores_max, scores_sum, rAccOut, params.softmax_scale) :
+            flash::softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, rAccOut, params.softmax_scale);
+
+        Tensor rP = flash::convert_type_f32_to_f16(rAccScore);
+        Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<TiledMMA>(scores.layout()));
+
+        flash::gemm_A_in_regs(rAccOut, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+        if (thread0() && nbi == 0) {
+            print(tOrP); printf("\n");
+            print(tOrVt); printf("\n");
+            print(tOsVt); printf("\n");
+        }
+        __syncthreads();
+
     }
 }
 

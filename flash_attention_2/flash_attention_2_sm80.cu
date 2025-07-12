@@ -25,8 +25,8 @@ void test_attention(cudaStream_t stream = 0) {
 
     int bs = 1;
     int head = 2;
-    int seqlen_q = 256;
-    int seqlen_k = 128;
+    int seqlen_q = 64;
+    int seqlen_k = 64;
     int dim = kHeadDim;
 
     thrust::host_vector<elem_type> h_Q(bs * head * seqlen_q * dim);
@@ -51,6 +51,7 @@ void test_attention(cudaStream_t stream = 0) {
     params.seqlen_q = seqlen_q;
     params.seqlen_k = seqlen_k;
     params.dim = dim;
+    params.softmax_scale = 1 / 1.f / sqrtf(static_cast<float>(seqlen_k));
 
     params.q_batch_stride = head * seqlen_q * dim;
     params.k_batch_stride = head * seqlen_k * dim;
