@@ -384,15 +384,32 @@ __global__ void flash_attention_v2_cute_kernel(const Params params) {
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_rowcol_Aregs<TiledMMA>(scores.layout()));
 
         flash::gemm_A_in_regs(rAccOut, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-
-        if (thread0() && nbi == 0) {
-            print(tOrP); printf("\n");
-            print(tOrVt); printf("\n");
-            print(tOsVt); printf("\n");
-        }
-        __syncthreads();
-
     }
+
+    // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+    Tensor acc_o_rowcol = make_tensor(rAccOut.data(), flash::convert_layout_acc_rowcol(rAccOut.layout()));
+
+    // for row
+    #pragma unroll
+    for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+        float sum = scores_sum(mi);
+        float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+        float scale = inv_sum;
+        // for col
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+            acc_o_rowcol(mi, ni) *= scale;
+        }
+    }
+
+    // Convert acc_o from fp32 to fp16/bf16
+    Tensor rO = flash::convert_type_f32_to_f16(rAccOut);
+    Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});
+
+    auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
+    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor taccOrO = smem_thr_copy_O.retile_S(rO);        // ((Atom,AtomNum), MMA_M, MMA_N)
+    Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 }
 
 }
